@@ -13,6 +13,8 @@ import android.net.wifi.WifiManager
 import android.nfc.NfcAdapter
 import android.nfc.Tag
 import android.nfc.tech.Ndef
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -22,6 +24,9 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import rikka.shizuku.Shizuku
+import java.io.BufferedReader
+import java.io.InputStreamReader
 
 @Suppress("DEPRECATION")
 @SuppressLint("MissingPermission", "SetTextI18n")
@@ -34,10 +39,21 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
     private var ir: ConsumerIrManager? = null
     private var nfcOn = false
 
+    private val shizukuPermCode = 9001
+    private val shizukuListener = Shizuku.OnRequestPermissionResultListener { code, grantResult ->
+        if (code == shizukuPermCode) {
+            ui.post {
+                log(if (grantResult == PackageManager.PERMISSION_GRANTED) "تم منح صلاحية Shizuku"
+                    else "تم رفض صلاحية Shizuku")
+            }
+        }
+    }
+
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         nfc = NfcAdapter.getDefaultAdapter(this)
         ir = getSystemService(Context.CONSUMER_IR_SERVICE) as? ConsumerIrManager
+        Shizuku.addRequestPermissionResultListener(shizukuListener)
 
         val sv = ScrollView(this)
         sv.layoutDirection = View.LAYOUT_DIRECTION_RTL
@@ -50,13 +66,19 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
         text("Flipper Phone", 24f)
         text("يكتشف عتاد هاتفك ويفعّل الوحدات المتوافقة فقط", 14f)
 
+        text("Shizuku", 18f)
+        button("تفعيل / طلب صلاحية Shizuku") { shizukuSetup() }
+
         val hasWifi = packageManager.hasSystemFeature(PackageManager.FEATURE_WIFI)
         val hasBle = packageManager.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE)
         val hasNfc = nfc != null
         val hasIr = ir?.hasIrEmitter() == true
         val hasUsb = packageManager.hasSystemFeature(PackageManager.FEATURE_USB_HOST)
 
-        section("Wi-Fi", hasWifi) { button("مسح الشبكات") { wifiScan() } }
+        section("Wi-Fi", hasWifi) {
+            button("مسح الشبكات") { wifiScan() }
+            button("مسح متقدم (BSSID حقيقي عبر Shizuku)") { wifiScanShizuku() }
+        }
         section("Bluetooth LE", hasBle) { button("مسح الأجهزة القريبة") { bleScan() } }
         section("NFC", hasNfc) { button("تشغيل/إيقاف قراءة البطاقات") { nfcToggle() } }
         section("IR (إرسال)", hasIr) {
@@ -71,7 +93,9 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
             button("صوت -") { sendIr(nec(0x04, 0x03)) }
             button("كتم") { sendIr(nec(0x04, 0x09)) }
         }
-        section("USB Host", hasUsb) { text("مكتشف فقط، لا توجد أدوات بعد", 14f) }
+        section("USB Host", hasUsb) {
+            button("فحص الأجهزة الموصولة") { usbScan() }
+        }
 
         text("النتيجة:", 16f)
         logView = TextView(this)
@@ -83,6 +107,66 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
     override fun onPause() {
         if (nfcOn) { nfc?.disableReaderMode(this); nfcOn = false }
         super.onPause()
+    }
+
+    override fun onDestroy() {
+        Shizuku.removeRequestPermissionResultListener(shizukuListener)
+        super.onDestroy()
+    }
+
+    // ---------- Shizuku ----------
+    private fun shizukuSetup() {
+        if (!Shizuku.pingBinder()) {
+            log("تطبيق Shizuku غير مشغَّل. افتحه وفعّل الخدمة أولاً (عبر ADB أو الروت)")
+            return
+        }
+        if (Shizuku.isPreV11()) {
+            log("نسخة Shizuku قديمة جداً، حدّثها")
+            return
+        }
+        if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
+            log("الصلاحية ممنوحة مسبقاً")
+            return
+        }
+        if (Shizuku.shouldShowRequestPermissionRationale()) {
+            log("رفضتَ الصلاحية سابقاً بشكل دائم، فعّلها يدوياً من تطبيق Shizuku")
+            return
+        }
+        Shizuku.requestPermission(shizukuPermCode)
+    }
+
+    private fun shizukuReady(): Boolean {
+        if (!Shizuku.pingBinder()) { log("شغّل تطبيق Shizuku أولاً"); return false }
+        if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+            log("اضغط زر تفعيل Shizuku أولاً وامنح الصلاحية"); return false
+        }
+        return true
+    }
+
+    // ينفّذ أمر shell عبر عملية Shizuku (مستوى صلاحية adb shell، وليس روت كاملاً)
+    private fun shizukuExec(cmd: String): String {
+        return try {
+            val method = Shizuku::class.java.getDeclaredMethod(
+                "newProcess", Array<String>::class.java, Array<String>::class.java, String::class.java
+            )
+            method.isAccessible = true
+            val process = method.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
+            val out = BufferedReader(InputStreamReader(process.inputStream)).readText()
+            val err = BufferedReader(InputStreamReader(process.errorStream)).readText()
+            process.waitFor()
+            if (out.isNotBlank()) out else if (err.isNotBlank()) "خطأ: $err" else "(لا نتيجة)"
+        } catch (e: Exception) {
+            "فشل التنفيذ عبر Shizuku: " + e.message
+        }
+    }
+
+    private fun wifiScanShizuku() {
+        if (!shizukuReady()) return
+        log("جاري الجلب عبر Shizuku...")
+        Thread {
+            val raw = shizukuExec("dumpsys wifi | grep -iE 'bssid|ssid|level|freq' | head -n 120")
+            ui.post { log(if (raw.isBlank()) "لا نتيجة، تأكد من اتصال Wi-Fi" else raw) }
+        }.start()
     }
 
     // ---------- UI helpers ----------
@@ -202,6 +286,45 @@ class MainActivity : Activity(), NfcAdapter.ReaderCallback {
             }
         } catch (e: Exception) { }
         runOnUiThread { log(sb.toString()) }
+    }
+
+    // ---------- USB ----------
+    // قاعدة بيانات أسماء شرائح USB معروفة (VID/PID) + ملاحظة عامة، بدون أي رابط تنزيل تلقائي.
+    // المصدر: معرّفات USB العامة المنشورة (usb.org / linux-usb.org)، للعرض فقط.
+    private data class ChipInfo(val name: String, val note: String)
+
+    private val usbChipDb = mapOf(
+        "0bda:8812" to ChipInfo("Realtek RTL8812AU", "شائع، يحتاج تعريف خارج الشجرة (aircrack-ng/rtl8812au) مبني لنواة هاتفك"),
+        "0bda:8813" to ChipInfo("Realtek RTL8812BU", "نسخة أحدث من 8812AU، نفس ملاحظة التعريف"),
+        "0bda:a81a" to ChipInfo("Realtek RTL8812AU (طراز آخر)", "نفس عائلة 8812AU"),
+        "0bda:8178" to ChipInfo("Realtek RTL8192CU", "دعم monitor mode محدود"),
+        "0cf3:9271" to ChipInfo("Atheros AR9271", "مدعوم جيداً في Kali NetHunter، يحتاج تعريف ath9k_htc"),
+        "148f:7601" to ChipInfo("MediaTek/Ralink MT7601U", "دعم ضعيف لـ monitor mode"),
+        "0e8d:7612" to ChipInfo("MediaTek MT7612U", "يحتاج تعريف mt76 خاص"),
+        "2357:0101" to ChipInfo("TP-Link Archer T2U (Realtek)", "يعتمد على شريحة Realtek الداخلية، راجع الاسم أعلاه")
+    )
+
+    private fun usbScan() {
+        val um = getSystemService(Context.USB_SERVICE) as UsbManager
+        val devices = um.deviceList.values.toList()
+        if (devices.isEmpty()) {
+            log("لا توجد أجهزة USB موصولة. وصّل الكرت عبر كابل OTG")
+            return
+        }
+        val sb = StringBuilder()
+        for (d: UsbDevice in devices) {
+            val key = "%04x:%04x".format(d.vendorId, d.productId)
+            val info = usbChipDb[key]
+            sb.append("VID:PID = ").append(key).append("\n")
+            if (info != null) {
+                sb.append("الشريحة: ").append(info.name).append("\n")
+                sb.append("ملاحظة: ").append(info.note).append("\n")
+            } else {
+                sb.append("شريحة غير معروفة في القاعدة المحلية، ابحث عن \"").append(key).append("\" يدوياً\n")
+            }
+            sb.append("اسم الجهاز: ").append(d.deviceName).append("\n\n")
+        }
+        log(sb.toString())
     }
 
     // ---------- IR ----------
